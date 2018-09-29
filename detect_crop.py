@@ -1,6 +1,7 @@
 """
     LYC:
     this file is copied and modified from detect.py.
+    very unclean implementation of detect person and crop. 
 """
 
 from __future__ import division
@@ -8,8 +9,10 @@ from __future__ import division
 import argparse
 import os
 import os.path as osp
+from shutil import copy2 
 import time
 
+import numpy as np 
 import cv2
 import torch
 from torch.autograd import Variable
@@ -17,6 +20,7 @@ from torch.autograd import Variable
 from darknet import Darknet
 from preprocess import prep_image
 from util import write_results, load_classes
+from tqdm import tqdm 
 
 
 def arg_parse():
@@ -239,4 +243,34 @@ def main(args, model):
 if __name__ == '__main__':
     args = arg_parse()
     model = get_model(args)
+
+    nr_sample_image = 1000
+    store_path = "/afs/csail.mit.edu/u/l/liuyingcheng/lyc_storage/"
+    raw_image_path = "/data/netmit/rf-vision/2d/raw/camera"
+
+    # get image list and random sample
+    all_image_path_list = []
+    for p, d, f in os.walk(raw_image_path):
+        for i in f:
+            assert ".jpg" in i  # assert image
+            all_image_path_list.append(os.path.join(p, i))
+        if len(all_image_path_list) > 100000:
+            break 
+
+    np.random.seed(233) 
+    sample_index = np.random.permutation(len(all_image_path_list))[:nr_sample_image]
+
+    raw_image_storage = os.path.join(store_path, "raw_image")
+    if not os.path.exists(raw_image_storage): 
+        os.makedirs(raw_image_storage) 
+    for image_idx in tqdm(sample_index):
+        copy2(all_image_path_list[image_idx], raw_image_storage)
+
+    args.images = os.path.join(store_path, "raw_image")
+    args.det = os.path.join(store_path, "crop_person")
+    if os.path.exists(args.det):
+        raise ValueError("crop_image_exists") 
+    os.mkdir(args.det) 
+
     main(args, model)
+
