@@ -17,8 +17,7 @@ from util import *
 
 def arg_parse():
     """
-    Parse arguements to the detect module
-    
+    Parse arguments to the detect module
     """
 
     parser = argparse.ArgumentParser(description='YOLO v3 Detection Module')
@@ -91,24 +90,20 @@ if __name__ == '__main__':
 
     load_batch = time.time()
 
-    batches = list(map(prep_image, imlist, [inp_dim for x in range(len(imlist))]))
-    im_batches = [x[0] for x in batches]
-    orig_ims = [x[1] for x in batches]
-    im_dim_list = [x[2] for x in batches]
-    im_dim_list = torch.FloatTensor(im_dim_list).repeat(1, 2)
+    # batches = list(map(prep_image, imlist, [inp_dim for x in range(len(imlist))]))
+    batches = [prep_image(img, inp_dim) for img in imlist]
+    im_batches = [x[0] for x in batches]  # each shape (1, 3, H, W) resized H, W
+    orig_ims = [x[1] for x in batches]  # each shape (1, 3, H0, W0) not resized
+    im_dim_list = torch.FloatTensor([x[2] for x in batches]).repeat(1, 2)  # (nr_img, 4)
 
     if CUDA:
         im_dim_list = im_dim_list.cuda()
 
-    leftover = 0
-
-    if len(im_dim_list) % batch_size:
-        leftover = 1
-
     if batch_size != 1:
+        leftover = 1 if len(im_dim_list) % batch_size else 0
         num_batches = len(imlist) // batch_size + leftover
-        im_batches = [torch.cat((im_batches[i * batch_size: min((i + 1) * batch_size,
-                                                                len(im_batches))])) for i in range(num_batches)]
+        im_batches = [torch.cat((im_batches[i * batch_size: min((i + 1) * batch_size, len(im_batches))]))
+                      for i in range(num_batches)]
 
     i = 0
 
@@ -134,8 +129,6 @@ if __name__ == '__main__':
             continue
 
         end = time.time()
-
-        #        print(end - start)
 
         prediction[:, 0] += i * batch_size
 
