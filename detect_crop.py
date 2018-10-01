@@ -9,18 +9,14 @@ from __future__ import division
 import argparse
 import os
 import os.path as osp
-from shutil import copy2 
 import time
 
-import numpy as np 
 import cv2
 import torch
-from torch.autograd import Variable
 
 from darknet import Darknet
 from preprocess import prep_image
-from util import write_results, load_classes
-from tqdm import tqdm 
+from util import write_results, load_classes, as_numpy
 
 
 def arg_parse():
@@ -39,7 +35,7 @@ def arg_parse():
     parser.add_argument("--cfg", dest='cfgfile', help="Config file", default="cfg/yolov3.cfg", type=str)
     parser.add_argument("--weights", dest='weightsfile', help="weightsfile", default="yolov3.weights", type=str)
     parser.add_argument("--reso", dest='reso',
-                        help="Input resolution of the network, trade off between accuracy and speed.", default="416",
+                        help="Input resolution of the network, trade off between accuracy and speed.", default="1024",
                         type=str)
     parser.add_argument("--scales", dest="scales", help="Scales to use for detection", default="1,2,3", type=str)
 
@@ -96,21 +92,16 @@ def main(args, model):
 
     load_batch = time.time()
 
-    batches = list(map(prep_image, imlist, [inp_dim for x in range(len(imlist))]))
-    im_batches = [x[0] for x in batches]
-    orig_ims = [x[1] for x in batches]
-    im_dim_list = [x[2] for x in batches]
-    im_dim_list = torch.FloatTensor(im_dim_list).repeat(1, 2)
+    batches = [prep_image(img, inp_dim) for img in imlist]
+    im_batches = [x[0] for x in batches]  # each shape (1, 3, H, W) resized H, W
+    orig_ims = [x[1] for x in batches]  # each shape (1, 3, H0, W0) not resized
+    im_dim_list = torch.FloatTensor([x[2] for x in batches]).repeat(1, 2)  # (nr_img, 4)
 
     if CUDA:
         im_dim_list = im_dim_list.cuda()
 
-    leftover = 0
-
-    if len(im_dim_list) % batch_size:
-        leftover = 1
-
     if batch_size != 1:
+        leftover = 1 if len(im_dim_list) % batch_size else 0
         num_batches = len(imlist) // batch_size + leftover
         im_batches = [torch.cat((im_batches[i * batch_size: min((i + 1) * batch_size, len(im_batches))]))
                       for i in range(num_batches)]
@@ -123,33 +114,17 @@ def main(args, model):
 
     for batch in im_batches:
         # load the image
-        start = time.time()
         if CUDA:
             batch = batch.cuda()
 
-        # Apply offsets to the result predictions
-        # Tranform the predictions as described in the YOLO paper
-        # flatten the prediction vector
-        # B x (bbox cord x no. of anchors) x grid_w x grid_h --> B x bbox x (all the boxes)
-        # Put every proposed box as a row.
         with torch.no_grad():
-            prediction = model(Variable(batch), CUDA)
-
-        # get the boxes with object confidence > threshold
-        # Convert the cordinates to absolute coordinates
-        # perform NMS on these boxes, and save the results
-        # I could have done NMS and saving seperately to have a better abstraction
-        # But both these operations require looping, hence
-        # clubbing these ops in one loop instead of two.
-        # loops are slower than vectorised operations.
+            prediction = model(batch, CUDA)
 
         prediction = write_results(prediction, confidence, num_classes, nms=True, nms_conf=nms_thesh)
 
         if type(prediction) == int:
             i += 1
             continue
-
-        end = time.time()
 
         prediction[:, 0] += i * batch_size
 
@@ -159,12 +134,6 @@ def main(args, model):
         else:
             output = torch.cat((output, prediction))
 
-        for im_num, image in enumerate(imlist[i * batch_size: min((i + 1) * batch_size, len(imlist))]):
-            im_id = i * batch_size + im_num
-            objs = [classes[int(x[-1])] for x in output if int(x[0]) == im_id]
-            print("{0:20s} predicted in {1:6.3f} seconds".format(image.split("/")[-1], (end - start) / batch_size))
-            print("{0:20s} {1:s}".format("Objects Detected:", " ".join(objs)))
-            print("----------------------------------------------------------")
         i += 1
 
         if CUDA:
@@ -195,32 +164,38 @@ def main(args, model):
 
     draw = time.time()
 
-    def _pad_bbox_to_square(c1, c2):
-        x1, y1 = c1
-        x2, y2 = c2
+    def _pad_bbox_to_square(c1, c2, pad_ratio=0.1):
+        x1, y1 = c1  # left up
+        x2, y2 = c2  # right down
         w, h = x2 - x1, y2 - y1
         if w > h:
-            return w, x1, y1 - (w - h) / 2.0
+            a, x, y = w, x1, y1 - (w - h) / 2.0
         else:
-            return h, x1 - (h - w) / 2.0, y1
+            a, x, y = h, x1 - (h - w) / 2.0, y1
+        # expand bbox
+        x = int(x - a * pad_ratio / 2)
+        y = int(y - a * pad_ratio / 2)
+        a = int(a + a * pad_ratio)
+        return a, x, y
 
-    def _write(prop_result, img, filename):
-        c1 = tuple(prop_result[1:3].int())
-        c2 = tuple(prop_result[3:5].int())
-        a, x, y = _pad_bbox_to_square(c1, c2)
-        if 0 < y and y + a < img.shape[0] and 0 < x and x + a < img.shape[1]:
-            crop = img[y:y + a, x:x + a]
-            crop = cv2.resize(crop, (224, 224))
-            cv2.imwrite(filename, crop)
+    def _write(a, x, y, img, filename):
+        crop = img[y:y + a, x:x + a]
+        crop = cv2.resize(crop, (224, 224))
+        cv2.imwrite(filename, crop)
 
     # crop, resize and save person detection
-    cnt_save_image = 0
+    img_idx2size = {}
     for o in output:
         if int(o[-1]) == 0:  # person: 0
             img_idx = int(o[0])
-            save_filename = "{}/{}.png".format(args.det, cnt_save_image)
-            _write(o, orig_ims[img_idx], save_filename)
-            cnt_save_image += 1
+            a, x, y = _pad_bbox_to_square(as_numpy(o[1:3].int()).tolist(), as_numpy(o[3:5].int()).tolist())
+            img = orig_ims[img_idx]
+            if 0 < y and y + a < img.shape[0] and 0 < x and x + a < img.shape[1]:
+                if img_idx in img_idx2size.keys() and a < img_idx2size[img_idx]:
+                    continue
+                save_filename = "{}/{}_cropped.png".format(args.det, img_idx)
+                _write(a, x, y, img, save_filename)
+                img_idx2size[img_idx] = a
 
     end = time.time()
 
@@ -244,33 +219,14 @@ if __name__ == '__main__':
     args = arg_parse()
     model = get_model(args)
 
-    nr_sample_image = 1000
-    store_path = "/afs/csail.mit.edu/u/l/liuyingcheng/lyc_storage/"
-    raw_image_path = "/data/netmit/rf-vision/2d/raw/camera"
+    raw_img_dir = "/afs/csail.mit.edu/u/l/liuyingcheng/lyc_storage/rf-pose-shape/single_person"
+    _, exp_dirs, _ = next(os.walk(raw_img_dir))
+    for exp in exp_dirs:
+        print("exp:", exp)
+        args.images = os.path.join(raw_img_dir, exp)
+        args.det = os.path.join(raw_img_dir, exp, "crop_person")
+        if os.path.exists(args.det):
+            raise ValueError("crop image exists")
+        os.mkdir(args.det)
 
-    # get image list and random sample
-    all_image_path_list = []
-    for p, d, f in os.walk(raw_image_path):
-        for i in f:
-            assert ".jpg" in i  # assert image
-            all_image_path_list.append(os.path.join(p, i))
-        if len(all_image_path_list) > 100000:
-            break 
-
-    np.random.seed(233) 
-    sample_index = np.random.permutation(len(all_image_path_list))[:nr_sample_image]
-
-    raw_image_storage = os.path.join(store_path, "raw_image")
-    if not os.path.exists(raw_image_storage): 
-        os.makedirs(raw_image_storage) 
-    for image_idx in tqdm(sample_index):
-        copy2(all_image_path_list[image_idx], raw_image_storage)
-
-    args.images = os.path.join(store_path, "raw_image")
-    args.det = os.path.join(store_path, "crop_person")
-    if os.path.exists(args.det):
-        raise ValueError("crop_image_exists") 
-    os.mkdir(args.det) 
-
-    main(args, model)
-
+        main(args, model)
